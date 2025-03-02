@@ -1,5 +1,11 @@
 {
-  "tauri": {
+  "mainBinaryName": "sh.loft.DevPod",
+  "plugins": {
+    "updater": {
+      "active": false
+    }
+  },
+  "app": {
     "windows": [
       {
         "title": "DevPod",
