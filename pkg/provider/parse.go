@@ -19,6 +19,7 @@ var optionNameRegEx = regexp.MustCompile(`[^A-Z0-9_]+`)
 
 var allowedTypes = []string{
 	"string",
+	"multiline",
 	"duration",
 	"number",
 	"boolean",
@@ -50,7 +51,7 @@ func validate(config *ProviderConfig) error {
 		return fmt.Errorf("name is missing in provider.yaml")
 	}
 	if ProviderNameRegEx.MatchString(config.Name) {
-		return fmt.Errorf("provider name can only include smaller case letters, numbers or dashes")
+		return fmt.Errorf("provider name can only include lowercase letters, numbers or dashes")
 	} else if len(config.Name) > 32 {
 		return fmt.Errorf("provider name cannot be longer than 32 characters")
 	}
@@ -83,6 +84,10 @@ func validate(config *ProviderConfig) error {
 
 		if optionValue.Global && optionValue.Cache != "" {
 			return fmt.Errorf("global and cache cannot be used together in option '%s'", optionName)
+		}
+
+		if optionValue.Global && optionValue.Mutable {
+			return fmt.Errorf("global and mutable cannot be used together in option '%s'", optionName)
 		}
 
 		if optionValue.Cache != "" {
@@ -162,12 +167,8 @@ func validateProviderType(config *ProviderConfig) error {
 	}
 
 	// validate driver
-	if config.Agent.Driver != "" && config.Agent.Driver != CustomDriver && config.Agent.Driver != DockerDriver {
-		if config.Agent.Driver == "kubernetes" {
-			return fmt.Errorf("kubernetes is not an in-built provider in this DevPod version anymore, please run `devpod provider update kubernetes kubernetes` to use the latest kubernetes provider")
-		}
-
-		return fmt.Errorf("agent.driver can only be docker or custom")
+	if config.Agent.Driver != "" && config.Agent.Driver != CustomDriver && config.Agent.Driver != DockerDriver && config.Agent.Driver != KubernetesDriver {
+		return fmt.Errorf("agent.driver can only be docker, kubernetes or custom")
 	}
 
 	// validate custom driver
@@ -193,6 +194,8 @@ func validateProviderType(config *ProviderConfig) error {
 		if len(config.Agent.Custom.CommandDevContainer) == 0 {
 			return fmt.Errorf("agent.custom.commandDevContainer is required")
 		}
+		// TODO: Add config.Agent.Custom.GetDevContainerLogs validation
+		// after we released a new version of the kubernetes provider and gave folks a chance to update
 	}
 
 	// agent binaries
