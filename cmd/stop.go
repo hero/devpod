@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/loft-sh/devpod/cmd/completion"
 	"github.com/loft-sh/devpod/cmd/flags"
 	client2 "github.com/loft-sh/devpod/pkg/client"
+	"github.com/loft-sh/devpod/pkg/client/clientimplementation"
 	"github.com/loft-sh/devpod/pkg/config"
 	workspace2 "github.com/loft-sh/devpod/pkg/workspace"
 	"github.com/loft-sh/log"
@@ -16,6 +18,7 @@ import (
 // StopCmd holds the destroy cmd flags
 type StopCmd struct {
 	*flags.GlobalFlags
+	client2.StopOptions
 }
 
 // NewStopCmd creates a new destroy command
@@ -24,21 +27,30 @@ func NewStopCmd(flags *flags.GlobalFlags) *cobra.Command {
 		GlobalFlags: flags,
 	}
 	stopCmd := &cobra.Command{
-		Use:   "stop",
-		Short: "Stops an existing workspace",
-		RunE: func(_ *cobra.Command, args []string) error {
-			ctx := context.Background()
+		Use:     "stop [flags] [workspace-path|workspace-name]",
+		Aliases: []string{"down"},
+		Short:   "Stops an existing workspace",
+		RunE: func(cobraCmd *cobra.Command, args []string) error {
+			ctx := cobraCmd.Context()
 			devPodConfig, err := config.LoadConfig(cmd.Context, cmd.Provider)
 			if err != nil {
 				return err
 			}
 
-			client, err := workspace2.GetWorkspace(devPodConfig, args, false, log.Default)
+			err = clientimplementation.DecodePlatformOptionsFromEnv(&cmd.StopOptions.Platform)
+			if err != nil {
+				return fmt.Errorf("decode platform options: %w", err)
+			}
+
+			client, err := workspace2.Get(ctx, devPodConfig, args, false, cmd.Owner, log.Default)
 			if err != nil {
 				return err
 			}
 
 			return cmd.Run(ctx, devPodConfig, client)
+		},
+		ValidArgsFunction: func(rootCmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			return completion.GetWorkspaceSuggestions(rootCmd, cmd.Context, cmd.Provider, args, toComplete, cmd.Owner, log.Default)
 		},
 	}
 
@@ -48,11 +60,13 @@ func NewStopCmd(flags *flags.GlobalFlags) *cobra.Command {
 // Run runs the command logic
 func (cmd *StopCmd) Run(ctx context.Context, devPodConfig *config.Config, client client2.BaseWorkspaceClient) error {
 	// lock workspace
-	err := client.Lock(ctx)
-	if err != nil {
-		return err
+	if !cmd.Platform.Enabled {
+		err := client.Lock(ctx)
+		if err != nil {
+			return err
+		}
+		defer client.Unlock()
 	}
-	defer client.Unlock()
 
 	// get instance status
 	instanceStatus, err := client.Status(ctx, client2.StatusOptions{})
@@ -87,7 +101,7 @@ func (cmd *StopCmd) stopSingleMachine(ctx context.Context, client client2.BaseWo
 	}
 
 	// try to find other workspace with same machine
-	workspaces, err := workspace2.ListWorkspaces(devPodConfig, log.Default)
+	workspaces, err := workspace2.List(ctx, devPodConfig, false, cmd.Owner, log.Default)
 	if err != nil {
 		return false, errors.Wrap(err, "list workspaces")
 	}

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/loft-sh/devpod/cmd/completion"
 	"github.com/loft-sh/devpod/cmd/flags"
 	"github.com/loft-sh/devpod/pkg/config"
 	"github.com/loft-sh/devpod/pkg/types"
@@ -30,10 +31,13 @@ func NewOptionsCmd(flags *flags.GlobalFlags) *cobra.Command {
 		GlobalFlags: flags,
 	}
 	optionsCmd := &cobra.Command{
-		Use:   "options",
+		Use:   "options [provider]",
 		Short: "Show options of an existing provider",
 		RunE: func(_ *cobra.Command, args []string) error {
 			return cmd.Run(context.Background(), args)
+		},
+		ValidArgsFunction: func(rootCmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			return completion.GetProviderSuggestions(rootCmd, cmd.Context, cmd.Provider, args, toComplete, cmd.Owner, log.Default)
 		},
 	}
 
@@ -63,6 +67,14 @@ func (cmd *OptionsCmd) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("please specify a provider")
 	}
 
+	if providerName != "" && cmd.GlobalFlags.Provider != "" {
+		if providerName != cmd.GlobalFlags.Provider {
+			log.Default.Infof("providerName=%+v", providerName)
+			log.Default.Infof("GlobalFlags.Provider=%+v", cmd.GlobalFlags.Provider)
+			return fmt.Errorf("ambiguous provider configuration detected")
+		}
+	}
+
 	providerWithOptions, err := workspace.FindProvider(devPodConfig, providerName, log.Default.ErrorStreamOnly())
 	if err != nil {
 		return err
@@ -74,7 +86,7 @@ func (cmd *OptionsCmd) Run(ctx context.Context, args []string) error {
 func printOptions(devPodConfig *config.Config, provider *workspace.ProviderWithOptions, format string, showHidden bool) error {
 	entryOptions := devPodConfig.ProviderOptions(provider.Config.Name)
 	dynamicOptions := devPodConfig.DynamicProviderOptionDefinitions(provider.Config.Name)
-	srcOptions := mergeDynamicOptions(provider.Config.Options, dynamicOptions)
+	srcOptions := MergeDynamicOptions(provider.Config.Options, dynamicOptions)
 	if format == "plain" {
 		tableEntries := [][]string{}
 		for optionName, entry := range srcOptions {
@@ -132,8 +144,8 @@ func printOptions(devPodConfig *config.Config, provider *workspace.ProviderWithO
 	return nil
 }
 
-// mergeOptions merges the static provider options and dynamic options
-func mergeDynamicOptions(options map[string]*types.Option, dynamicOptions config.OptionDefinitions) map[string]*types.Option {
+// MergeDynamicOptions merges the static provider options and dynamic options
+func MergeDynamicOptions(options map[string]*types.Option, dynamicOptions config.OptionDefinitions) map[string]*types.Option {
 	retOptions := map[string]*types.Option{}
 	for k, option := range options {
 		retOptions[k] = option

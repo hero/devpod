@@ -2,54 +2,25 @@ package shell
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
-	command2 "github.com/loft-sh/devpod/pkg/command"
 	"github.com/pkg/errors"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
 
-func ExecuteCommandWithShell(
-	ctx context.Context,
-	command string,
-	stdin io.Reader,
-	stdout io.Writer,
-	stderr io.Writer,
-	environ []string,
-) error {
+func RunEmulatedShell(ctx context.Context, command string, stdin io.Reader, stdout io.Writer, stderr io.Writer, env []string) error {
 	command = strings.ReplaceAll(command, "\r", "")
 
-	// try to find a proper shell
-	if runtime.GOOS != "windows" {
-		if command2.Exists("bash") {
-			cmd := exec.CommandContext(ctx, "bash", "-c", command)
-			cmd.Stdin = stdin
-			cmd.Stdout = stdout
-			cmd.Stderr = stderr
-			cmd.Env = environ
-			return cmd.Run()
-		} else if command2.Exists("sh") {
-			cmd := exec.CommandContext(ctx, "sh", "-c", command)
-			cmd.Stdin = stdin
-			cmd.Stdout = stdout
-			cmd.Stderr = stderr
-			cmd.Env = environ
-			return cmd.Run()
-		}
-	}
-
-	// run emulated shell
-	return RunEmulatedShell(ctx, command, stdin, stdout, stderr, environ)
-}
-
-func RunEmulatedShell(ctx context.Context, command string, stdin io.Reader, stdout io.Writer, stderr io.Writer, env []string) error {
 	// Let's parse the complete command
 	parsed, err := syntax.NewParser().Parse(strings.NewReader(command), "")
 	if err != nil {
@@ -120,4 +91,75 @@ func (devNull) Write(p []byte) (int, error) {
 
 func (devNull) Close() error {
 	return nil
+}
+
+func GetShell(userName string) ([]string, error) {
+	// try to get a shell
+	if runtime.GOOS != "windows" {
+		// infere login shell from getent
+		shell, err := getUserShell(userName)
+		if err == nil {
+			return []string{shell}, nil
+		}
+
+		// fallback to $SHELL env var
+		shell, ok := os.LookupEnv("SHELL")
+		if ok {
+			return []string{shell}, nil
+		}
+
+		// fallback to path discovery
+		_, err = exec.LookPath("bash")
+		if err == nil {
+			return []string{"bash"}, nil
+		}
+
+		_, err = exec.LookPath("sh")
+		if err == nil {
+			return []string{"sh"}, nil
+		}
+	}
+
+	// fallback to our in-built shell
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+
+	return []string{executable, "helper", "sh"}, nil
+}
+
+func getUserShell(userName string) (string, error) {
+	currentUser, err := findUser(userName)
+	if err != nil {
+		return "", err
+	}
+	output, err := exec.Command("getent", "passwd", currentUser.Username).Output()
+	if err != nil {
+		return "", err
+	}
+
+	shell := strings.Split(string(output), ":")
+	if len(shell) != 7 {
+		return "", fmt.Errorf("unexpected getent format: %s", string(output))
+	}
+
+	loginShell := strings.TrimSpace(filepath.Base(shell[6]))
+	if loginShell == "nologin" {
+		return "", fmt.Errorf("no login shell configured")
+	}
+
+	return loginShell, nil
+}
+
+func findUser(userName string) (*user.User, error) {
+	if userName != "" {
+		u, err := user.Lookup(userName)
+		if err != nil {
+			return nil, err
+		}
+		return u, nil
+	}
+
+	return user.Current()
 }

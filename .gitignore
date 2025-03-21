@@ -2,8 +2,11 @@
 .DS_Store
 /test
 /e2e/bin
-devpod
+/devpod
+/devpod.exe
+/devpod-cli
 # Unit test targets
-main
-profile.out
-tags
+/main
+/profile.out
+/package-lock.json
+/tags

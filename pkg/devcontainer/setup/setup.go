@@ -1,43 +1,46 @@
 package setup
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/loft-sh/api/v4/pkg/devpod"
+	"github.com/loft-sh/devpod/pkg/agent/tunnel"
 	"github.com/loft-sh/devpod/pkg/command"
 	copy2 "github.com/loft-sh/devpod/pkg/copy"
 	"github.com/loft-sh/devpod/pkg/devcontainer/config"
 	"github.com/loft-sh/devpod/pkg/envfile"
-	"github.com/loft-sh/devpod/pkg/types"
+	"github.com/loft-sh/devpod/pkg/gitcredentials"
 	"github.com/loft-sh/log"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 const (
 	ResultLocation = "/var/run/devpod/result.json"
 )
 
-func SetupContainer(setupInfo *config.Result, extraWorkspaceEnv []string, chownWorkspace bool, log log.Logger) error {
+func SetupContainer(ctx context.Context, setupInfo *config.Result, extraWorkspaceEnv []string, chownProjects bool, platformOptions *devpod.PlatformOptions, tunnelClient tunnel.TunnelClient, log log.Logger) error {
 	// write result to ResultLocation
 	WriteResult(setupInfo, log)
 
 	// chown user dir
-	if chownWorkspace {
-		err := ChownWorkspace(setupInfo, log)
-		if err != nil {
-			return errors.Wrap(err, "chown workspace")
-		}
+	err := ChownWorkspace(setupInfo, chownProjects, log)
+	if err != nil {
+		return errors.Wrap(err, "chown workspace")
 	}
 
 	// patch remote env
 	log.Debugf("Patch etc environment & profile...")
-	err := PatchEtcEnvironment(setupInfo.MergedConfig, log)
+	err = PatchEtcEnvironment(setupInfo.MergedConfig, log)
 	if err != nil {
 		return errors.Wrap(err, "patch etc environment")
 	}
@@ -64,11 +67,23 @@ func SetupContainer(setupInfo *config.Result, extraWorkspaceEnv []string, chownW
 		return errors.Wrap(err, "chown ssh agent sock file")
 	}
 
-	// run commands
-	log.Debugf("Run post create commands...")
-	err = PostCreateCommands(setupInfo, log)
+	// setup kube config
+	err = SetupKubeConfig(ctx, setupInfo, tunnelClient, log)
 	if err != nil {
-		return errors.Wrap(err, "post create commands")
+		log.Errorf("Error setting up KubeConfig: %v", err)
+	}
+
+	// setup platform git credentials
+	err = setupPlatformGitCredentials(config.GetRemoteUser(setupInfo), platformOptions, log)
+	if err != nil {
+		log.Errorf("Error setting up platform git credentials: %v", err)
+	}
+
+	// run commands
+	log.Debugf("Run lifecycle hooks commands...")
+	err = RunLifecycleHooks(ctx, setupInfo, log)
+	if err != nil {
+		return errors.Wrap(err, "lifecycle hooks")
 	}
 
 	log.Debugf("Done setting up environment")
@@ -93,7 +108,7 @@ func WriteResult(setupInfo *config.Result, log log.Logger) {
 		return
 	}
 
-	err = os.WriteFile(ResultLocation, rawBytes, 0666)
+	err = os.WriteFile(ResultLocation, rawBytes, 0600)
 	if err != nil {
 		log.Warnf("Error write result to %s: %v", ResultLocation, err)
 		return
@@ -132,7 +147,7 @@ func LinkRootHome(setupInfo *config.Result) error {
 	return nil
 }
 
-func ChownWorkspace(setupInfo *config.Result, log log.Logger) error {
+func ChownWorkspace(setupInfo *config.Result, recursive bool, log log.Logger) error {
 	user := config.GetRemoteUser(setupInfo)
 	exists, err := markerFileExists("chownWorkspace", "")
 	if err != nil {
@@ -141,11 +156,23 @@ func ChownWorkspace(setupInfo *config.Result, log log.Logger) error {
 		return nil
 	}
 
-	log.Infof("Chown workspace...")
-	err = copy2.ChownR(setupInfo.SubstitutionContext.ContainerWorkspaceFolder, user)
-	// do not exit on error, we can have non-fatal errors
-	if err != nil {
-		log.Warn(err)
+	workspaceRoot := filepath.Dir(setupInfo.SubstitutionContext.ContainerWorkspaceFolder)
+
+	if workspaceRoot != "/" {
+		log.Infof("Chown workspace...")
+		err = copy2.Chown(workspaceRoot, user)
+		if err != nil {
+			log.Warn(err)
+		}
+	}
+
+	if recursive {
+		log.Infof("Chown projects...")
+		err = copy2.ChownR(setupInfo.SubstitutionContext.ContainerWorkspaceFolder, user)
+		// do not exit on error, we can have non-fatal errors
+		if err != nil {
+			log.Warn(err)
+		}
 	}
 
 	return nil
@@ -226,36 +253,74 @@ func ChownAgentSock(setupInfo *config.Result) error {
 	return nil
 }
 
-func PostCreateCommands(setupInfo *config.Result, log log.Logger) error {
-	remoteUser := config.GetRemoteUser(setupInfo)
-	mergedConfig := setupInfo.MergedConfig
+// SetupKubeConfig retrieves and stores a KubeConfig file in the default location `$HOME/.kube/config`.
+// It merges our KubeConfig with existing ones.
+func SetupKubeConfig(ctx context.Context, setupInfo *config.Result, tunnelClient tunnel.TunnelClient, log log.Logger) error {
+	exists, err := markerFileExists("setupKubeConfig", "")
+	if err != nil {
+		return err
+	} else if exists || tunnelClient == nil {
+		return nil
+	}
+	log.Info("Setup KubeConfig")
 
-	// only run once per container run
-	err := runPostCreateCommand(mergedConfig.OnCreateCommands, remoteUser, setupInfo.SubstitutionContext.ContainerWorkspaceFolder, setupInfo.MergedConfig.RemoteEnv, "onCreateCommands", setupInfo.ContainerDetails.Created, log)
+	// get kubernetes config from setup server
+	kubeConfigRes, err := tunnelClient.KubeConfig(ctx, &tunnel.Message{})
+	if err != nil {
+		return err
+	} else if kubeConfigRes.Message == "" {
+		return nil
+	}
+
+	user := config.GetRemoteUser(setupInfo)
+	homeDir, err := command.GetHome(user)
 	if err != nil {
 		return err
 	}
 
-	// TODO: rerun when contents changed
-	err = runPostCreateCommand(mergedConfig.UpdateContentCommands, remoteUser, setupInfo.SubstitutionContext.ContainerWorkspaceFolder, setupInfo.MergedConfig.RemoteEnv, "updateContentCommands", setupInfo.ContainerDetails.Created, log)
+	kubeDir := filepath.Join(homeDir, ".kube")
+	err = os.Mkdir(kubeDir, 0755)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+
+	configPath := filepath.Join(kubeDir, "config")
+	existingConfig, err := clientcmd.LoadFromFile(configPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if existingConfig == nil {
+		existingConfig = clientcmdapi.NewConfig()
+	}
+
+	kubeConfig, err := clientcmd.Load([]byte(kubeConfigRes.Message))
+	if err != nil {
+		return err
+	}
+	// merge with existing kubeConfig
+	for name, cluster := range kubeConfig.Clusters {
+		existingConfig.Clusters[name] = cluster
+	}
+	for name, authInfo := range kubeConfig.AuthInfos {
+		existingConfig.AuthInfos[name] = authInfo
+	}
+	for name, context := range kubeConfig.Contexts {
+		existingConfig.Contexts[name] = context
+	}
+
+	// Set the current context to the new one.
+	// This might not always be the correct choice but given that someone
+	// explicitly required this workspace to be in a virtual cluster/space
+	// it's fair to assume they also want to point the current context to it
+	existingConfig.CurrentContext = kubeConfig.CurrentContext
+
+	err = clientcmd.WriteToFile(*existingConfig, configPath)
 	if err != nil {
 		return err
 	}
 
-	// only run once per container run
-	err = runPostCreateCommand(mergedConfig.PostCreateCommands, remoteUser, setupInfo.SubstitutionContext.ContainerWorkspaceFolder, setupInfo.MergedConfig.RemoteEnv, "postCreateCommands", setupInfo.ContainerDetails.Created, log)
-	if err != nil {
-		return err
-	}
-
-	// run when the container was restarted
-	err = runPostCreateCommand(mergedConfig.PostStartCommands, remoteUser, setupInfo.SubstitutionContext.ContainerWorkspaceFolder, setupInfo.MergedConfig.RemoteEnv, "postStartCommands", setupInfo.ContainerDetails.State.StartedAt, log)
-	if err != nil {
-		return err
-	}
-
-	// run always when attaching to the container
-	err = runPostCreateCommand(mergedConfig.PostAttachCommands, remoteUser, setupInfo.SubstitutionContext.ContainerWorkspaceFolder, setupInfo.MergedConfig.RemoteEnv, "postAttachCommands", "", log)
+	// ensure `remoteUser` owns kubeConfig
+	err = copy2.ChownR(kubeDir, user)
 	if err != nil {
 		return err
 	}
@@ -274,7 +339,7 @@ func markerFileExists(markerName string, markerContent string) (bool, error) {
 
 	// write marker
 	_ = os.MkdirAll(filepath.Dir(markerName), 0777)
-	err = os.WriteFile(markerName, []byte(markerContent), 0666)
+	err = os.WriteFile(markerName, []byte(markerContent), 0644)
 	if err != nil {
 		return false, errors.Wrap(err, "write marker")
 	}
@@ -282,59 +347,115 @@ func markerFileExists(markerName string, markerContent string) (bool, error) {
 	return false, nil
 }
 
-func runPostCreateCommand(commands []types.LifecycleHook, user, dir string, remoteEnv map[string]string, name, content string, log log.Logger) error {
-	if len(commands) == 0 {
+func setupPlatformGitCredentials(userName string, platformOptions *devpod.PlatformOptions, log log.Logger) error {
+	// platform is not enabled, skip
+	if !platformOptions.Enabled {
 		return nil
 	}
 
-	// check marker file
-	if content != "" {
-		exists, err := markerFileExists(name, content)
-		if err != nil {
-			return err
-		} else if exists {
-			return nil
+	// setup platform git user
+	if platformOptions.UserCredentials.GitUser != "" && platformOptions.UserCredentials.GitEmail != "" {
+		gitUser, err := gitcredentials.GetUser(userName)
+		if err == nil && gitUser.Name == "" && gitUser.Email == "" {
+			log.Info("Setup workspace git user and email")
+			err := gitcredentials.SetUser(userName, &gitcredentials.GitUser{
+				Name:  platformOptions.UserCredentials.GitUser,
+				Email: platformOptions.UserCredentials.GitEmail,
+			})
+			if err != nil {
+				return fmt.Errorf("set git user: %w", err)
+			}
 		}
 	}
 
-	remoteEnvArr := []string{}
-	for k, v := range remoteEnv {
-		remoteEnvArr = append(remoteEnvArr, k+"="+v)
+	// setup platform git http credentials
+	err := setupPlatformGitHTTPCredentials(userName, platformOptions, log)
+	if err != nil {
+		log.Errorf("Error setting up platform git http credentials: %v", err)
 	}
 
-	writer := log.Writer(logrus.InfoLevel, false)
-	errwriter := log.Writer(logrus.ErrorLevel, false)
-	defer writer.Close()
-	defer errwriter.Close()
+	// setup platform git ssh keys
+	err = setupPlatformGitSSHKeys(userName, platformOptions, log)
+	if err != nil {
+		log.Errorf("Error setting up platform git ssh keys: %v", err)
+	}
 
-	for _, cmd := range commands {
-		if len(cmd) == 0 {
+	return nil
+}
+func setupPlatformGitHTTPCredentials(userName string, platformOptions *devpod.PlatformOptions, log log.Logger) error {
+	if !platformOptions.Enabled || len(platformOptions.UserCredentials.GitHttp) == 0 {
+		return nil
+	}
+
+	log.Info("Setup platform user git http credentials")
+	binaryPath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	err = gitcredentials.ConfigureHelper(binaryPath, userName, -1)
+	if err != nil {
+		return fmt.Errorf("configure git helper: %w", err)
+	}
+
+	return nil
+}
+
+func setupPlatformGitSSHKeys(userName string, platformOptions *devpod.PlatformOptions, log log.Logger) error {
+	if !platformOptions.Enabled || len(platformOptions.UserCredentials.GitSsh) == 0 {
+		return nil
+	}
+
+	log.Info("Setup platform user git ssh keys")
+	homeFolder, err := command.GetHome(userName)
+	if err != nil {
+		return err
+	}
+
+	// write ssh keys to ~/.ssh/id_rsa
+	sshFolder := filepath.Join(homeFolder, ".ssh")
+	err = os.MkdirAll(sshFolder, 0700)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	_ = copy2.Chown(sshFolder, userName)
+
+	// delete previous keys
+	files, err := os.ReadDir(sshFolder)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if !strings.HasPrefix(file.Name(), "platform_git_ssh_") {
 			continue
 		}
 
-		for k, c := range cmd {
-			log.Infof("Run command %s: %s...", k, strings.Join(c, " "))
-			args := []string{}
-			if user != "root" {
-				args = append(args, "su", user, "-c", command.Quote(c))
-			} else {
-				args = append(args, "sh", "-c", command.Quote(c))
-			}
+		fileName := strings.TrimPrefix(file.Name(), "platform_git_ssh_")
+		index, err := strconv.Atoi(fileName)
+		if err != nil {
+			continue
+		}
+		if index >= len(platformOptions.UserCredentials.GitSsh) {
+			continue
+		}
 
-			// create command
-			cmd := exec.Command(args[0], args[1:]...)
-			cmd.Dir = dir
-			cmd.Env = os.Environ()
-			cmd.Env = append(cmd.Env, remoteEnvArr...)
-			cmd.Stdout = writer
-			cmd.Stderr = errwriter
-			log.Debugf("Executing command %s: %s...", k, cmd.Args)
-			err := cmd.Run()
+		err = os.Remove(filepath.Join(sshFolder, file.Name()))
+		if err != nil {
+			log.Warnf("Error removing previous platform git ssh key: %v", err)
+		}
+	}
+
+	// write new keys
+	for i, key := range platformOptions.UserCredentials.GitSsh {
+		fileName := filepath.Join(sshFolder, fmt.Sprintf("platform_git_ssh_%d", i))
+		err = os.WriteFile(fileName, []byte(key.Key), 0600)
+		if err != nil {
+			log.Warnf("Error writing platform git ssh key: %v", err)
+		} else {
+			err = copy2.Chown(fileName, userName)
+			// do not exit on error, we can have non-fatal errors
 			if err != nil {
-				log.Debugf("Failed running postCreateCommand lifecycle script %s: %v", cmd.Args, err)
-				return fmt.Errorf("failed to run: %s, error: %w", strings.Join(c, " "), err)
+				log.Warnf("Error chowning platform git ssh keys: %v", err)
 			}
-			log.Donef("Successfully ran command %s: %s", k, strings.Join(c, " "))
 		}
 	}
 

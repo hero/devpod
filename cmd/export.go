@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/loft-sh/devpod/cmd/completion"
 	"github.com/loft-sh/devpod/cmd/flags"
 	"github.com/loft-sh/devpod/pkg/config"
 	"github.com/loft-sh/devpod/pkg/provider"
@@ -24,8 +25,9 @@ func NewExportCmd(flags *flags.GlobalFlags) *cobra.Command {
 		GlobalFlags: flags,
 	}
 	exportCmd := &cobra.Command{
-		Use:   "export",
-		Short: "Exports a workspace configuration",
+		Use:    "export [flags] [workspace-path|workspace-name]",
+		Short:  "Exports a workspace configuration",
+		Hidden: true,
 		RunE: func(_ *cobra.Command, args []string) error {
 			ctx := context.Background()
 			devPodConfig, err := config.LoadConfig(cmd.Context, cmd.Provider)
@@ -34,6 +36,9 @@ func NewExportCmd(flags *flags.GlobalFlags) *cobra.Command {
 			}
 
 			return cmd.Run(ctx, devPodConfig, args)
+		},
+		ValidArgsFunction: func(rootCmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			return completion.GetWorkspaceSuggestions(rootCmd, cmd.Context, cmd.Provider, args, toComplete, cmd.Owner, log.Default)
 		},
 	}
 
@@ -44,7 +49,7 @@ func NewExportCmd(flags *flags.GlobalFlags) *cobra.Command {
 func (cmd *ExportCmd) Run(ctx context.Context, devPodConfig *config.Config, args []string) error {
 	// try to load workspace
 	logger := log.Default.ErrorStreamOnly()
-	client, err := workspace2.GetWorkspace(devPodConfig, args, false, logger)
+	client, err := workspace2.Get(ctx, devPodConfig, args, false, cmd.Owner, logger)
 	if err != nil {
 		return err
 	}

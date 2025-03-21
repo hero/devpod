@@ -121,6 +121,9 @@ type ProviderAgentConfig struct {
 
 	// Custom holds custom driver specific configuration
 	Custom ProviderCustomDriverConfig `json:"custom,omitempty"`
+
+	// Kubernetes holds kubernetes specific configuration
+	Kubernetes ProviderKubernetesDriverConfig `json:"kubernetes,omitempty"`
 }
 
 type ProviderDockerlessOptions struct {
@@ -133,6 +136,9 @@ type ProviderDockerlessOptions struct {
 	// IgnorePaths are additional ignore paths that should be ignored during deletion
 	IgnorePaths string `json:"ignorePaths,omitempty"`
 
+	// Registry to use as remote cache
+	RegistryCache string `json:"registryCache,omitempty"`
+
 	// DisableDockerCredentials prevents docker credentials from getting injected
 	DisableDockerCredentials types.StrBool `json:"disableDockerCredentials,omitempty"`
 }
@@ -142,8 +148,9 @@ func (a ProviderAgentConfig) IsDockerDriver() bool {
 }
 
 const (
-	DockerDriver = "docker"
-	CustomDriver = "custom"
+	DockerDriver     = "docker"
+	KubernetesDriver = "kubernetes"
+	CustomDriver     = "custom"
 )
 
 type ProviderCustomDriverConfig struct {
@@ -167,6 +174,12 @@ type ProviderCustomDriverConfig struct {
 
 	// DeleteDevContainer is used to delete the devcontainer
 	DeleteDevContainer types.StrArray `json:"deleteDevContainer,omitempty"`
+
+	// CanReprovision returns true if the driver can reprovision the devcontainer
+	CanReprovision types.StrBool `json:"canReprovision,omitempty"`
+
+	// GetDevContainerLogs returns the logs of the devcontainer
+	GetDevContainerLogs types.StrArray `json:"getDevContainerLogs,omitempty"`
 }
 
 type ProviderDockerDriverConfig struct {
@@ -176,8 +189,39 @@ type ProviderDockerDriverConfig struct {
 	// If false, DevPod will not try to install docker into the machine.
 	Install types.StrBool `json:"install,omitempty"`
 
+	// Builder to use with docker
+	Builder string `json:"builder,omitempty"`
+
 	// Environment variables to set when running docker commands
 	Env map[string]string `json:"env,omitempty"`
+}
+
+type ProviderKubernetesDriverConfig struct {
+	KubernetesContext   string `json:"kubernetesContext,omitempty"`
+	KubernetesConfig    string `json:"kubernetesConfig,omitempty"`
+	KubernetesNamespace string `json:"kubernetesNamespace,omitempty"`
+	PodTimeout          string `json:"podTimeout,omitempty"`
+
+	KubernetesPullSecretsEnabled string `json:"kubernetesPullSecretsEnabled,omitempty"`
+	CreateNamespace              string `json:"createNamespace,omitempty"`
+	ClusterRole                  string `json:"clusterRole,omitempty"`
+	ServiceAccount               string `json:"serviceAccount,omitempty"`
+
+	Architecture      string `json:"architecture,omitempty"`
+	InactivityTimeout string `json:"inactivityTimeout,omitempty"`
+	StorageClass      string `json:"storageClass,omitempty"`
+
+	DiskSize             string `json:"diskSize,omitempty"`
+	PvcAccessMode        string `json:"pvcAccessMode,omitempty"`
+	PvcAnnotations       string `json:"pvcAnnotations,omitempty"`
+	NodeSelector         string `json:"nodeSelector,omitempty"`
+	Resources            string `json:"resources,omitempty"`
+	WorkspaceVolumeMount string `json:"workspaceVolumeMount,omitempty"`
+
+	PodManifestTemplate string `json:"podManifestTemplate,omitempty"`
+	Labels              string `json:"labels,omitempty"`
+
+	StrictSecurity string `json:"strictSecurity,omitempty"`
 }
 
 type ProviderAgentConfigExec struct {
@@ -230,6 +274,9 @@ type ProviderCommands struct {
 
 	// Proxy proxies commands
 	Proxy *ProxyCommands `json:"proxy,omitempty"`
+
+	// Daemon commands
+	Daemon *DaemonCommands `json:"daemon,omitempty"`
 }
 
 type ProxyCommands struct {
@@ -247,6 +294,71 @@ type ProxyCommands struct {
 
 	// Status proxies the status command
 	Status types.StrArray `json:"status,omitempty"`
+
+	// Health checks the health of the platform
+	Health types.StrArray `json:"health,omitempty"`
+
+	// Create creates entities associated with this provider
+	Create CreateProxyCommands `json:"create,omitempty"`
+
+	// Get gets entities associated with this provider
+	Get GetProxyCommands `json:"get,omitempty"`
+
+	// List lists all entities associated with this provider
+	List ListProxyCommands `json:"list,omitempty"`
+
+	// Watch lists all entities associated with this provider and then watches for changes
+	Watch WatchProxyCommands `json:"watch,omitempty"`
+
+	// Update updates entities associated with this provider
+	Update UpdateProxyCommands `json:"update,omitempty"`
+}
+
+type ListProxyCommands struct {
+	// Workspaces lists all workspaces
+	Workspaces types.StrArray `json:"workspaces,omitempty"`
+
+	// Projects lists all projects
+	Projects types.StrArray `json:"projects,omitempty"`
+
+	// Templates lists all templates in a project
+	Templates types.StrArray `json:"templates,omitempty"`
+
+	// Clusters lists all clusters and runners in a project
+	Clusters types.StrArray `json:"clusters,omitempty"`
+}
+
+type WatchProxyCommands struct {
+	// Workspaces watches all workspaces and updates on changes
+	Workspaces types.StrArray `json:"workspaces,omitempty"`
+}
+
+type CreateProxyCommands struct {
+	// Workspace creates a workspace instance
+	Workspace types.StrArray `json:"workspace,omitempty"`
+}
+
+type GetProxyCommands struct {
+	// Workspace gets a workspace instance
+	Workspace types.StrArray `json:"workspace,omitempty"`
+
+	// Self gets self for this provider
+	Self types.StrArray `json:"self,omitempty"`
+
+	// Version gets the for this pro instance
+	Version types.StrArray `json:"version,omitempty"`
+}
+
+type UpdateProxyCommands struct {
+	// Workspace updates a workspace instance
+	Workspace types.StrArray `json:"workspace,omitempty"`
+}
+
+type DaemonCommands struct {
+	// Start starts the daemon
+	Start types.StrArray `json:"start,omitempty"`
+	// Status gets the daemon status
+	Status types.StrArray `json:"status,omitempty"`
 }
 
 type SubOptions struct {
@@ -259,4 +371,12 @@ func (c *ProviderConfig) IsMachineProvider() bool {
 
 func (c *ProviderConfig) IsProxyProvider() bool {
 	return c.Exec.Proxy != nil
+}
+
+func (c *ProviderConfig) HasHealthCheck() bool {
+	return c.Exec.Proxy != nil && len(c.Exec.Proxy.Health) > 0
+}
+
+func (c *ProviderConfig) IsDaemonProvider() bool {
+	return c.Exec.Daemon != nil
 }

@@ -1,101 +1,66 @@
 package credentials
 
 import (
+	"bytes"
+	"cmp"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 
-	"github.com/gofrs/flock"
 	"github.com/loft-sh/devpod/pkg/agent/tunnel"
-	"github.com/loft-sh/devpod/pkg/dockercredentials"
-	"github.com/loft-sh/devpod/pkg/gitcredentials"
 	"github.com/loft-sh/log"
 	"github.com/pkg/errors"
 )
 
+const DefaultPort = "12049"
+const CredentialsServerPortEnv = "DEVPOD_CREDENTIALS_SERVER_PORT"
+
 func RunCredentialsServer(
 	ctx context.Context,
-	userName string,
 	port int,
-	configureGitUser,
-	configureGitHelper,
-	configureDockerHelper bool,
 	client tunnel.TunnelClient,
 	log log.Logger,
 ) error {
-	if configureGitUser || configureGitHelper || configureDockerHelper {
-		fileLock := flock.New(filepath.Join(os.TempDir(), "devpod-credentials.lock"))
-		locked, err := fileLock.TryLock()
-		if err != nil {
-			return errors.Wrap(err, "acquire lock")
-		} else if !locked {
-			return nil
-		}
-		defer func(fileLock *flock.Flock) {
-			_ = fileLock.Unlock()
-		}(fileLock)
-
-		binaryPath, err := os.Executable()
-		if err != nil {
-			return err
-		}
-
-		// configure docker credential helper
-		if configureDockerHelper {
-			// configure the creds store
-			err = dockercredentials.ConfigureCredentialsContainer(userName, port, log)
+	var handler http.Handler = http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		log.Debugf("Incoming client connection at %s", request.URL.Path)
+		if request.URL.Path == "/git-credentials" {
+			err := handleGitCredentialsRequest(ctx, writer, request, client, log)
 			if err != nil {
-				return err
+				http.Error(writer, err.Error(), http.StatusInternalServerError)
+				return
 			}
-		}
-
-		// configure git user
-		if configureGitUser {
-			err = configureGitUserLocally(ctx, userName, client)
+		} else if request.URL.Path == "/docker-credentials" {
+			err := handleDockerCredentialsRequest(ctx, writer, request, client, log)
 			if err != nil {
-				log.Debugf("Error configuring git user: %v", err)
+				http.Error(writer, err.Error(), http.StatusInternalServerError)
+				return
 			}
-		}
-
-		// configure git credential helper
-		if configureGitHelper {
-			// configure helper
-			err = gitcredentials.ConfigureHelper(binaryPath, userName, port)
+		} else if request.URL.Path == "/git-ssh-signature" {
+			err := handleGitSSHSignatureRequest(ctx, writer, request, client, log)
 			if err != nil {
-				return errors.Wrap(err, "configure git helper")
+				http.Error(writer, err.Error(), http.StatusInternalServerError)
+				return
 			}
-
-			// cleanup when we are done
-			defer func(userName string) {
-				_ = gitcredentials.RemoveHelper(userName)
-			}(userName)
+		} else if request.URL.Path == "/loft-platform-credentials" {
+			err := handleLoftPlatformCredentialsRequest(ctx, writer, request, client, log)
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusInternalServerError)
+			}
+		} else if request.URL.Path == "/gpg-public-keys" {
+			err := handleGPGPublicKeysRequest(ctx, writer, request, client, log)
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusInternalServerError)
+			}
 		}
-	}
+	})
 
-	srv := &http.Server{
-		Addr: "localhost:" + strconv.Itoa(port),
-		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-			log.Debugf("Incoming client connection at %s", request.URL.Path)
-			if request.URL.Path == "/git-credentials" {
-				err := handleGitCredentialsRequest(ctx, writer, request, client, log)
-				if err != nil {
-					http.Error(writer, err.Error(), http.StatusInternalServerError)
-					return
-				}
-			} else if request.URL.Path == "/docker-credentials" {
-				err := handleDockerCredentialsRequest(ctx, writer, request, client, log)
-				if err != nil {
-					http.Error(writer, err.Error(), http.StatusInternalServerError)
-					return
-				}
-			}
-		}),
-	}
+	addr := net.JoinHostPort("localhost", strconv.Itoa(port))
+	srv := &http.Server{Addr: addr, Handler: handler}
 
 	errChan := make(chan error, 1)
 	go func() {
@@ -118,43 +83,41 @@ func RunCredentialsServer(
 	}
 }
 
-func configureGitUserLocally(ctx context.Context, userName string, client tunnel.TunnelClient) error {
-	// get local credentials
-	localGitUser, err := gitcredentials.GetUser()
+func GetPort() (int, error) {
+	strPort := cmp.Or(os.Getenv(CredentialsServerPortEnv), DefaultPort)
+	port, err := strconv.Atoi(strPort)
 	if err != nil {
-		return err
-	} else if localGitUser.Name != "" && localGitUser.Email != "" {
-		return nil
+		return 0, fmt.Errorf("convert port %s: %w", strPort, err)
 	}
 
-	// set user & email if not found
-	response, err := client.GitUser(ctx, &tunnel.Empty{})
+	return port, nil
+}
+
+func prepareRequest(req *http.Request, proxyAddr string) (http.Request, error) {
+	proxyReq := *req
+	var b bytes.Buffer
+	_, err := b.ReadFrom(req.Body)
 	if err != nil {
-		return fmt.Errorf("retrieve git user: %w", err)
+		return proxyReq, fmt.Errorf("read body: %w", err)
 	}
+	req.Body = io.NopCloser(&b)
+	proxyReq.Body = io.NopCloser(bytes.NewReader(b.Bytes()))
 
-	// parse git user from response
-	gitUser := &gitcredentials.GitUser{}
-	err = json.Unmarshal([]byte(response.Message), gitUser)
+	// rewrite target
+	p, err := url.JoinPath(fmt.Sprintf("http://%s", proxyAddr), req.URL.Path)
 	if err != nil {
-		return fmt.Errorf("decode git user: %w", err)
+		return proxyReq, fmt.Errorf("join url path \"http://%s\", \"%s\": %w", proxyAddr, req.URL.Path, err)
 	}
 
-	// don't override what is already there
-	if localGitUser.Name != "" {
-		gitUser.Name = ""
-	}
-	if localGitUser.Email != "" {
-		gitUser.Email = ""
-	}
-
-	// set git user
-	err = gitcredentials.SetUser(userName, gitUser)
+	proxyURL, err := url.Parse(p)
 	if err != nil {
-		return fmt.Errorf("set git user & email: %w", err)
+		return proxyReq, fmt.Errorf("parse proxy url %s: %w", p, err)
 	}
 
-	return nil
+	proxyReq.URL = proxyURL
+	proxyReq.RequestURI = ""
+
+	return proxyReq, nil
 }
 
 func handleDockerCredentialsRequest(ctx context.Context, writer http.ResponseWriter, request *http.Request, client tunnel.TunnelClient, log log.Logger) error {
@@ -187,6 +150,60 @@ func handleGitCredentialsRequest(ctx context.Context, writer http.ResponseWriter
 	if err != nil {
 		log.Debugf("Error receiving git credentials: %v", err)
 		return errors.Wrap(err, "get git credentials response")
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write([]byte(response.Message))
+	log.Debugf("Successfully wrote back %d bytes", len(response.Message))
+	return nil
+}
+
+func handleGitSSHSignatureRequest(ctx context.Context, writer http.ResponseWriter, request *http.Request, client tunnel.TunnelClient, log log.Logger) error {
+	out, err := io.ReadAll(request.Body)
+	if err != nil {
+		return errors.Wrap(err, "read request body")
+	}
+
+	log.Debugf("Received git ssh signature post data: %s", string(out))
+	response, err := client.GitSSHSignature(ctx, &tunnel.Message{Message: string(out)})
+	if err != nil {
+		log.Errorf("Error receiving git ssh signature: %w", err)
+		return errors.Wrap(err, "get git ssh signature")
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write([]byte(response.Message))
+	log.Debugf("Successfully wrote back %d bytes", len(response.Message))
+	return nil
+}
+
+func handleLoftPlatformCredentialsRequest(ctx context.Context, writer http.ResponseWriter, request *http.Request, client tunnel.TunnelClient, log log.Logger) error {
+	out, err := io.ReadAll(request.Body)
+	if err != nil {
+		return errors.Wrap(err, "read request body")
+	}
+
+	log.Debugf("Received loft platform credentials post data: %s", string(out))
+	response, err := client.LoftConfig(ctx, &tunnel.Message{Message: string(out)})
+	if err != nil {
+		log.Errorf("Error receiving platform credentials: %w", err)
+		return errors.Wrap(err, "get platform credentials")
+	}
+
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write([]byte(response.Message))
+	log.Debugf("Successfully wrote back %d bytes", len(response.Message))
+	return nil
+}
+
+func handleGPGPublicKeysRequest(ctx context.Context, writer http.ResponseWriter, request *http.Request, client tunnel.TunnelClient, log log.Logger) error {
+	response, err := client.GPGPublicKeys(ctx, &tunnel.Message{})
+	if err != nil {
+		log.Errorf("Error receiving gpg public keys: %w", err)
+		return errors.Wrap(err, "get gpg public keys")
 	}
 
 	writer.Header().Set("Content-Type", "application/json")

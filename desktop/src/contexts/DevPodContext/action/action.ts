@@ -1,7 +1,7 @@
 import { Result, SingleEventManager, EventManager } from "../../../lib"
 import { v4 as uuidv4 } from "uuid"
 
-export type TActionName = "start" | "stop" | "rebuild" | "remove" | "checkStatus"
+export type TActionName = "start" | "stop" | "rebuild" | "reset" | "remove" | "checkStatus"
 export type TActionFn = (context: TActionContext) => Promise<Result<unknown>>
 export type TActionStatus = "pending" | "success" | "error" | "cancelled"
 export type TActionID = Action["id"]
@@ -66,8 +66,6 @@ export class Action {
   }
 
   public run() {
-    // TODO: Cancel somehow?
-
     this.actionFn({ id: this.id }).then((result) => {
       if (result.err) {
         this.failed(result.val)
@@ -84,7 +82,6 @@ export class Action {
       return
     }
     // We're no longer interested in status updates
-    // TODO: cancel somehow?
     this.eventManager.clear()
     this._status = "cancelled"
     this._finishedAt = Date.now()

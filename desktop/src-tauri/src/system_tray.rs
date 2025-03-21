@@ -1,15 +1,28 @@
-use crate::{workspaces::WorkspacesState, AppHandle, AppState, UiMessage};
+use crate::{
+    resource_watcher::{ProState, WorkspacesState},
+    ui_messages::{OpenProInstanceMsg, OpenWorkspaceMsg},
+    util, AppHandle, AppState, UiMessage,
+};
 use log::{error, warn};
 use tauri::{
-    CustomMenuItem, Manager, State, SystemTray as TauriSystemTray, SystemTrayEvent, SystemTrayMenu,
-    SystemTrayMenuItem, SystemTraySubmenu,
+    menu::{Menu, MenuBuilder, MenuEvent, MenuItem, Submenu},
+    tray::{MouseButton, TrayIcon, TrayIconEvent},
+    Manager, Wry,
 };
+use util::QUIT_EXIT_CODE;
 
-pub trait SystemTrayIdentifier {}
-pub type SystemTrayClickHandler = Box<dyn Fn(&AppHandle, State<AppState>)>;
+#[cfg(not(target_os = "macos"))]
+pub static WARNING_SYSTEM_TRAY_ICON_BYTES: &'static [u8] = include_bytes!("../icons/icon_warning_system_tray_color.png");
+#[cfg(target_os = "macos")]
+pub static WARNING_SYSTEM_TRAY_ICON_BYTES: &'static [u8] = include_bytes!("../icons/icon_warning_system_tray.png");
+
+#[cfg(not(target_os = "macos"))]
+pub static SYSTEM_TRAY_ICON_BYTES: &'static [u8] = include_bytes!("../icons/icon_system_tray_color.png");
+#[cfg(target_os = "macos")]
+pub static SYSTEM_TRAY_ICON_BYTES: &'static [u8] = include_bytes!("../icons/icon_system_tray.png");
+
 pub trait ToSystemTraySubmenu {
-    fn to_submenu(&self) -> SystemTraySubmenu;
-    fn on_tray_item_clicked(&self, tray_item_id: &str) -> Option<SystemTrayClickHandler>;
+    fn to_submenu(&self, app_handle: &AppHandle) -> anyhow::Result<Submenu<Wry>>;
 }
 
 pub struct SystemTray {}
@@ -26,46 +39,102 @@ impl SystemTray {
 }
 
 impl SystemTray {
-    pub fn build_menu(
-        &self,
-        submenu_builders: Vec<Box<&dyn ToSystemTraySubmenu>>,
-    ) -> SystemTrayMenu {
-        let show_dashboard = CustomMenuItem::new(Self::SHOW_DASHBOARD_ID, "Show Dashboard");
-        let quit = CustomMenuItem::new(Self::QUIT_ID, "Quit");
+    pub async fn init(&self, app_handle: &AppHandle) -> anyhow::Result<Menu<Wry>> {
+        let mut menu = MenuBuilder::new(app_handle);
+        let show_dashboard = MenuItem::with_id(
+            app_handle,
+            Self::SHOW_DASHBOARD_ID,
+            "Show Dashboard",
+            true,
+            None::<&str>,
+        )?;
+        menu = menu.item(&show_dashboard);
 
-        let mut tray_menu = SystemTrayMenu::new()
-            .add_item(show_dashboard)
-            .add_native_item(SystemTrayMenuItem::Separator);
+        let state = app_handle.state::<AppState>();
 
-        for builder in submenu_builders {
-            let submenu = builder.to_submenu();
-            tray_menu = tray_menu.add_submenu(submenu)
+        let mut workspaces = state.workspaces.write().await;
+        let submenu = workspaces.to_submenu(app_handle)?;
+        menu = menu.item(&submenu);
+        workspaces.set_submenu(submenu);
+
+        let mut pro = state.pro.write().await;
+        let submenu = pro.to_submenu(app_handle)?;
+        menu = menu.item(&submenu);
+        pro.set_submenu(submenu);
+
+        let quit = MenuItem::with_id(app_handle, Self::QUIT_ID, "Quit", true, None::<&str>)?;
+        menu = menu.item(&quit);
+
+        let m = menu.build()?;
+
+        Ok(m)
+    }
+
+    pub fn get_menu_event_handler(&self) -> impl Fn(&AppHandle, MenuEvent) + Send + Sync {
+        |app, event| match event.id.as_ref() {
+            Self::QUIT_ID => app.exit(QUIT_EXIT_CODE),
+            Self::SHOW_DASHBOARD_ID => {
+                let app_state = app.state::<AppState>();
+
+                tauri::async_runtime::block_on(async move {
+                    if let Err(err) = app_state.ui_messages.send(UiMessage::ShowDashboard).await {
+                        error!("Failed to broadcast show dashboard message: {}", err);
+                    };
+                });
+            }
+            id => {
+                let app_state = app.state::<AppState>();
+
+                tauri::async_runtime::block_on(async move {
+                    if let Err(err) = app_state.ui_messages.send(UiMessage::ShowDashboard).await {
+                        error!("Failed to broadcast show dashboard message: {}", err);
+                    };
+                    if id.starts_with(WorkspacesState::IDENTIFIER_PREFIX) {
+                        let tx = &app_state.ui_messages;
+
+                        if id == WorkspacesState::CREATE_WORKSPACE_ID {
+                            if let Err(err) = tx
+                                .send(UiMessage::OpenWorkspace(OpenWorkspaceMsg::empty()))
+                                .await
+                            {
+                                error!("Failed to send create workspace message: {:?}", err);
+                            };
+                        } else {
+                            let workspace_id = id.replace(WorkspacesState::IDENTIFIER_PREFIX, "");
+                            if let Err(err) = tx
+                                .send(UiMessage::OpenWorkspace(OpenWorkspaceMsg::with_id(
+                                    workspace_id,
+                                )))
+                                .await
+                            {
+                                error!("Failed to send create workspace message: {:?}", err);
+                            };
+                        }
+                    } else if id.starts_with(ProState::IDENTIFIER_PREFIX) {
+                        let tx = &app_state.ui_messages;
+
+                        let host = id.replace(ProState::IDENTIFIER_PREFIX, "");
+                        if let Err(err) = tx
+                            .send(UiMessage::OpenProInstance(OpenProInstanceMsg {
+                                host: Some(host),
+                            }))
+                            .await
+                        {
+                            error!("Failed to send open pro instance message: {:?}", err);
+                        };
+                    } else {
+                        warn!("Received unhandled click for ID: {}", id);
+                    }
+                });
+            }
         }
-
-        tray_menu = tray_menu
-            .add_native_item(SystemTrayMenuItem::Separator)
-            .add_item(quit);
-
-        tray_menu
     }
 
-    pub fn build_tray(
-        &self,
-        submenu_builders: Vec<Box<&dyn ToSystemTraySubmenu>>,
-    ) -> TauriSystemTray {
-        let tray_menu = self.build_menu(submenu_builders);
-
-        TauriSystemTray::new().with_menu(tray_menu)
-    }
-
-    pub fn get_event_handler(&self) -> impl Fn(&AppHandle, SystemTrayEvent) + Send + Sync {
-        |app, event| match event {
-            SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
-                Self::QUIT_ID => {
-                    std::process::exit(0);
-                }
-                Self::SHOW_DASHBOARD_ID => {
-                    let app_state = app.state::<AppState>();
+    pub fn get_tray_icon_event_handler(&self) -> impl Fn(&TrayIcon, TrayIconEvent) + Send + Sync {
+        |icon, event| match event {
+            TrayIconEvent::DoubleClick { button, .. } => {
+                if button == MouseButton::Left {
+                    let app_state = icon.app_handle().state::<AppState>();
 
                     tauri::async_runtime::block_on(async move {
                         if let Err(err) = app_state.ui_messages.send(UiMessage::ShowDashboard).await
@@ -74,22 +143,7 @@ impl SystemTray {
                         };
                     });
                 }
-                id => {
-                    let app_state = app.state::<AppState>();
-                    let mut maybe_handler: Option<_> = None;
-
-                    if id.starts_with(WorkspacesState::IDENTIFIER_PREFIX) {
-                        let workspaces_state = &*app_state.workspaces.lock().unwrap();
-                        maybe_handler = workspaces_state.on_tray_item_clicked(id);
-                    } else {
-                        warn!("Received unhandled click for ID: {}", id);
-                    }
-
-                    if let Some(handler) = maybe_handler {
-                        handler(app, app_state);
-                    }
-                }
-            },
+            }
             _ => {}
         }
     }

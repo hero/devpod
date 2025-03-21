@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime/debug"
 
 	"github.com/loft-sh/devpod/cmd/agent"
+	"github.com/loft-sh/devpod/cmd/completion"
 	"github.com/loft-sh/devpod/cmd/context"
 	"github.com/loft-sh/devpod/cmd/flags"
 	"github.com/loft-sh/devpod/cmd/helper"
@@ -25,9 +25,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var (
-	globalFlags *flags.GlobalFlags
-)
+var globalFlags *flags.GlobalFlags
 
 // NewRootCmd returns a new root command
 func NewRootCmd() *cobra.Command {
@@ -37,8 +35,6 @@ func NewRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cobraCmd *cobra.Command, args []string) error {
-			telemetry.Collector.SetCLIData(cobraCmd, globalFlags)
-
 			if globalFlags.LogOutput == "json" {
 				log2.Default.SetFormat(log2.JSONFormat)
 			} else if globalFlags.LogOutput == "raw" {
@@ -59,6 +55,11 @@ func NewRootCmd() *cobra.Command {
 				_ = os.Setenv(config.DEVPOD_HOME, globalFlags.DevPodHome)
 			}
 
+			devPodConfig, err := config.LoadConfig(globalFlags.Context, globalFlags.Provider)
+			if err == nil {
+				telemetry.StartCLI(devPodConfig, cobraCmd)
+			}
+
 			return nil
 		},
 		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
@@ -74,21 +75,13 @@ func NewRootCmd() *cobra.Command {
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	defer func() {
-		// recover from panic in order to log it via telemetry
-		if err := recover(); err != nil {
-			retErr := fmt.Errorf("panic: %v %s", err, debug.Stack())
-			telemetry.Collector.RecordEndEvent(retErr)
-			log2.Default.Fatal(retErr)
-		}
-	}()
-
 	// build the root command
 	rootCmd := BuildRoot()
 
 	// execute command
 	err := rootCmd.Execute()
-	telemetry.Collector.RecordEndEvent(err)
+	telemetry.CollectorCLI.RecordCLI(err)
+	telemetry.CollectorCLI.Flush()
 	if err != nil {
 		//nolint:all
 		if sshExitErr, ok := err.(*ssh.ExitError); ok {
@@ -120,6 +113,7 @@ func BuildRoot() *cobra.Command {
 	rootCmd := NewRootCmd()
 	persistentFlags := rootCmd.PersistentFlags()
 	globalFlags = flags.SetGlobalFlags(persistentFlags)
+	_ = completion.RegisterFlagCompletionFuns(rootCmd, globalFlags)
 
 	rootCmd.AddCommand(agent.NewAgentCmd(globalFlags))
 	rootCmd.AddCommand(provider.NewProviderCmd(globalFlags))
@@ -128,7 +122,7 @@ func BuildRoot() *cobra.Command {
 	rootCmd.AddCommand(ide.NewIDECmd(globalFlags))
 	rootCmd.AddCommand(machine.NewMachineCmd(globalFlags))
 	rootCmd.AddCommand(context.NewContextCmd(globalFlags))
-	rootCmd.AddCommand(pro.NewProCmd(globalFlags))
+	rootCmd.AddCommand(pro.NewProCmd(globalFlags, log2.Default))
 	rootCmd.AddCommand(NewUpCmd(globalFlags))
 	rootCmd.AddCommand(NewDeleteCmd(globalFlags))
 	rootCmd.AddCommand(NewSSHCmd(globalFlags))
@@ -140,5 +134,9 @@ func BuildRoot() *cobra.Command {
 	rootCmd.AddCommand(NewLogsDaemonCmd(globalFlags))
 	rootCmd.AddCommand(NewExportCmd(globalFlags))
 	rootCmd.AddCommand(NewImportCmd(globalFlags))
+	rootCmd.AddCommand(NewLogsCmd(globalFlags))
+	rootCmd.AddCommand(NewUpgradeCmd())
+	rootCmd.AddCommand(NewTroubleshootCmd(globalFlags))
+	rootCmd.AddCommand(NewPingCmd(globalFlags))
 	return rootCmd
 }
